@@ -93,8 +93,8 @@ class RDMRecordResourceConfig(RecordResourceConfig, ConfiguratorMixin):
     blueprint_name = "records"
     url_prefix = "/records"
 
-    routes = RecordResourceConfig.routes
-
+    routes = RecordResourceConfig.routes,
+    routes["communites"]="/communites"
     # PIDs
     routes["item-pids-reserve"] = "/<pid_value>/draft/pids/<scheme>"
     # Review

@@ -11,6 +11,7 @@
 
 """Bibliographic Record Resource."""
 
+import uuid
 from flask import abort, g, send_file
 from flask_cors import cross_origin
 from flask_resources import (
@@ -45,7 +46,7 @@ from .serializers import (
     IIIFManifestV2JSONSerializer,
     IIIFSequenceV2JSONSerializer,
 )
-
+from invenio_userprofiles import current_userprofile
 
 class RDMRecordResource(RecordResource):
     """RDM record resource."""
@@ -60,6 +61,7 @@ class RDMRecordResource(RecordResource):
         routes = self.config.routes
         url_rules = super().create_url_rules()
         url_rules += [
+            route("POST", p(routes["communites"]), self.createCommunites),
             route("POST", p(routes["item-pids-reserve"]), self.pids_reserve),
             route("DELETE", p(routes["item-pids-reserve"]), self.pids_discard),
             route("GET", p(routes["item-review"]), self.review_read),
@@ -130,6 +132,22 @@ class RDMRecordResource(RecordResource):
     #
     # PIDs
     #
+    def createCommunites(self):
+        # request_data = request.get_json()
+        print("below are the communites")
+        
+        institution =current_userprofile.affiliations.lower()
+        institution = institution.replace(" ", "_")
+
+        user_id = str(uuid.uuid4())
+        
+        identifer = f"{institution}_{user_id}"
+        
+        print(identifer)  # Output: pixel_3
+        data={"institution":institution,
+                "identifer":identifer
+                }
+        return data ,200
     @request_extra_args
     @request_view_args
     @response_handler()
