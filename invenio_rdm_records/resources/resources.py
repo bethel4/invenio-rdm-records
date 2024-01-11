@@ -10,10 +10,16 @@
 # it under the terms of the MIT License; see LICENSE file for more details.
 
 """Bibliographic Record Resource."""
-
+from functools import wraps
 import uuid
-from flask import abort, g, send_file
+
+from invenio_userprofiles import current_userprofile
+from flask_login import current_user
+
+from flask import abort, current_app, g, redirect, send_file, url_for, request, jsonify
+from invenio_db import db
 from flask_cors import cross_origin
+from flask_mail import Message
 from flask_resources import (
     HTTPJSONException,
     Resource,
@@ -29,6 +35,7 @@ from importlib_metadata import version
 from invenio_drafts_resources.resources import RecordResource
 from invenio_drafts_resources.resources.records.errors import RedirectException
 from invenio_records_resources.resources.errors import ErrorHandlersMixin
+from invenio_records_resources.resources.records.headers import etag_headers
 from invenio_records_resources.resources.records.resource import (
     request_data,
     request_extra_args,
@@ -37,16 +44,24 @@ from invenio_records_resources.resources.records.resource import (
     request_search_args,
     request_view_args,
 )
+from invenio_rdm_records.records.models import RDMRecordMetadata
 from invenio_records_resources.resources.records.utils import search_preference
+from invenio_stats import current_stats
+from sqlalchemy.exc import NoResultFound
+from sqlalchemy.sql.expression import update
 from werkzeug.utils import secure_filename
-
+from .modal import SavedRecords
+from invenio_accounts.models import LoginInformation, Role, User
 from .serializers import (
     IIIFCanvasV2JSONSerializer,
     IIIFInfoV2JSONSerializer,
     IIIFManifestV2JSONSerializer,
     IIIFSequenceV2JSONSerializer,
 )
-from invenio_userprofiles import current_userprofile
+from invenio_communities.communities.records.models import CommunityMetadata
+from invenio_communities.members.records.models import MemberModel
+from sqlalchemy.orm import joinedload
+
 
 class RDMRecordResource(RecordResource):
     """RDM record resource."""
@@ -61,16 +76,264 @@ class RDMRecordResource(RecordResource):
         routes = self.config.routes
         url_rules = super().create_url_rules()
         url_rules += [
-            route("POST", p(routes["communites"]), self.createCommunites),
             route("POST", p(routes["item-pids-reserve"]), self.pids_reserve),
             route("DELETE", p(routes["item-pids-reserve"]), self.pids_discard),
             route("GET", p(routes["item-review"]), self.review_read),
             route("PUT", p(routes["item-review"]), self.review_update),
             route("DELETE", p(routes["item-review"]), self.review_delete),
             route("POST", p(routes["item-actions-review"]), self.review_submit),
+            route(
+                "POST",
+                p(routes["record-access-request"]),
+                self.create_access_request,
+            ),
+            route(
+                "PUT",
+                p(routes["access-request-settings"]),
+                self.update_access_settings,
+            ),
+            route("DELETE", p(routes["delete-record"]), self.delete_record),
+            route("POST", p(routes["restore-record"]), self.restore_record),
+            route("POST", p(routes["set-record-quota"]), self.set_record_quota),
+            # TODO: move to users?
+            route("POST", routes["set-user-quota"], self.set_user_quota),
+            route("POST", p(routes["saved"]), self.saved),
+            route("POST", p(routes["send_email"]), self.send_email),
+            route("GET", p(routes["saved"]), self.get_saved),
+            route("POST", p(routes["communites"]), self.createCommunites),
+            route("GET", p(routes["role"]), self.userRole),
         ]
 
         return url_rules
+
+    def userInfo(self):
+        if current_user.is_authenticated:
+            user_id = current_user.get_id()
+            return user_id
+
+        else:
+            print("No user is currently logged in.")
+
+    def createCommunites(self):
+        institution = current_userprofile.affiliations.lower()
+        institution = institution.replace(" ", "_")
+
+        user_id = str(uuid.uuid4())
+
+        role = ""
+        user_ids = self.userInfo()
+        user = (
+            User.query.filter(User.id == user_ids)
+            .options(joinedload(User.roles))
+            .first()
+        )
+
+        if user:
+            roles = user.roles
+            for role in roles:
+                role = role.name
+
+        else:
+            print("User not found.")
+        if role == "student":
+            identifer = f"{institution}_{user_id}_student"
+            data = {"institution": institution, "identifer": identifer}
+        else:
+            identifer = f"{institution}_{user_id}"
+            data = {"institution": institution, "identifer": identifer}
+
+        return data, 200
+
+    def userRole(self):
+        user_id = self.userInfo()
+        list_slug = []
+
+        communities = CommunityMetadata.query.filter(
+            CommunityMetadata.deletion_status == "P"
+        ).all()
+        for community in communities:
+            if community.slug.split("_")[-1] == "student":
+                list_slug.append(community.id)
+
+        update_statement = (
+            update(CommunityMetadata)
+            .where(CommunityMetadata.id.in_(list_slug))
+            .values(community_status=True)
+        )
+
+        community_ids = [community.id for community in communities]
+        user_community_roles = MemberModel.query.filter(
+            MemberModel.user_id == user_id, MemberModel.community_id.in_(community_ids)
+        ).all()
+
+        community_statuses = []
+        for role in user_community_roles:
+            community = CommunityMetadata.query.filter(
+                CommunityMetadata.id == role.community_id
+            ).first()
+
+            if community:
+                community_status = {
+                    "id": str(community.id),
+                    "community_status": community.community_status,
+                }
+            community_statuses.append(community_status)
+        db.session.execute(update_statement)
+        db.session.commit()
+
+        return community_statuses
+
+    def send_email(self):
+        request_data = request.get_json()
+        name = request_data.get("name")
+        email = request_data.get("email")
+        subject = request_data.get("subject")
+        description = request_data.get("message")
+        with current_app.app_context():
+            msg = Message(
+                "Message from gresis user",
+                sender="contact@gresis.org",
+                recipients=["contact@gresis.org"],
+            )
+            msg.body = f"Name: {name}\nEmail: {email}\nSubject:{subject}\nDescription: {description}"
+            mail = current_app.extensions.get("mail")
+            mail.send(msg)
+
+            return "Message sent!"
+
+    useer_id = userInfo
+
+    @response_handler()
+    def saved(self):
+        user_id = self.userInfo()
+
+        request_data = request.get_json()
+        me = SavedRecords(user_id, record_id=request_data["record_id"])
+        db.session.add(me)
+        db.session.commit()
+        return request_data, 200  # HTTP 200 status code.
+
+    @request_view_args
+    def get_saved(self):
+        lists = []
+        role = ""
+        user_id = self.userInfo()
+        user = (
+            User.query.filter(User.id == user_id)
+            .options(joinedload(User.roles))
+            .first()
+        )
+
+        if user:
+            roles = user.roles
+            for role in roles:
+                role = role.name
+        else:
+            print("User not found.")
+        data = {"hits": []}
+        for record in SavedRecords.query.filter_by(user_id=user_id):
+            lists.append(record.record_id)
+        result = RDMRecordMetadata.query.filter(RDMRecordMetadata.json["id"].in_(lists))
+        for r in result:
+            data["hits"].append(r.json)
+
+        return data
+
+    @request_extra_args
+    @request_read_args
+    @request_view_args
+    @response_handler()
+    def read(self):
+        """Read an item."""
+        try:
+            item = self.service.read(
+                g.identity,
+                resource_requestctx.view_args["pid_value"],
+                expand=resource_requestctx.args.get("expand", False),
+                # allows to access deleted record if permissions match
+                include_deleted=resource_requestctx.args.get("include_deleted", False),
+            )
+        except NoResultFound:
+            # If the parent pid is being used we can get the id of the latest record and redirect
+            latest_version = self.service.read_latest(
+                g.identity,
+                resource_requestctx.view_args["pid_value"],
+                expand=resource_requestctx.args.get("expand", False),
+            )
+            return (
+                redirect(
+                    url_for(
+                        ".read",
+                        pid_value=latest_version.id,
+                    )
+                ),
+                None,  # We pass None to create a tuple as the response_handler always expects an iterable
+            )
+
+        # we emit the record view stats event here rather than in the service because
+        # the service might be called from other places as well that we don't want
+        # to count, e.g. from some CLI commands
+        emitter = current_stats.get_event_emitter("record-view")
+        if item is not None and emitter is not None:
+            emitter(current_app, record=item._record, via_api=True)
+
+        return item.to_dict(), 200
+
+    @request_headers
+    @request_view_args
+    @request_data
+    def set_record_quota(self):
+        """Set record quota resource."""
+        item = self.service.set_quota(
+            g.identity,
+            resource_requestctx.view_args["pid_value"],
+            data=resource_requestctx.data,
+        )
+
+        return {}, 200
+
+    @request_headers
+    @request_view_args
+    @request_data
+    def set_user_quota(self):
+        """Set user quota resource."""
+        item = self.service.set_user_quota(
+            g.identity,
+            id_=resource_requestctx.view_args["pid_value"],
+            data=resource_requestctx.data,
+        )
+
+        return {}, 200
+
+    #
+    # Deletion workflows
+    #
+    @request_headers
+    @request_view_args
+    @request_data
+    def delete_record(self):
+        """Read the related review request."""
+        item = self.service.delete_record(
+            g.identity,
+            resource_requestctx.view_args["pid_value"],
+            resource_requestctx.data,
+            revision_id=resource_requestctx.headers.get("if_match"),
+        )
+
+        return item.to_dict(), 204
+
+    @request_headers
+    @request_view_args
+    @request_data
+    def restore_record(self):
+        """Read the related review request."""
+        item = self.service.restore_record(
+            g.identity,
+            resource_requestctx.view_args["pid_value"],
+            resource_requestctx.data,
+        )
+
+        return item.to_dict(), 200
 
     #
     # Review request
@@ -114,7 +377,6 @@ class RDMRecordResource(RecordResource):
     @request_headers
     @request_view_args
     @request_data
-    @response_handler()
     def review_submit(self):
         """Submit a draft for review or directly publish it."""
         require_review = False
@@ -132,22 +394,6 @@ class RDMRecordResource(RecordResource):
     #
     # PIDs
     #
-    def createCommunites(self):
-        # request_data = request.get_json()
-        print("below are the communites")
-        
-        institution =current_userprofile.affiliations.lower()
-        institution = institution.replace(" ", "_")
-
-        user_id = str(uuid.uuid4())
-        
-        identifer = f"{institution}_{user_id}"
-        
-        print(identifer)  # Output: pixel_3
-        data={"institution":institution,
-                "identifer":identifer
-                }
-        return data ,200
     @request_extra_args
     @request_view_args
     @response_handler()
@@ -176,6 +422,33 @@ class RDMRecordResource(RecordResource):
 
         return item.to_dict(), 200
 
+    @request_view_args
+    @request_data
+    def create_access_request(self):
+        """Request access to a record as authenticated user."""
+        item = self.service.access.request_access(
+            id_=resource_requestctx.view_args["pid_value"],
+            identity=g.identity,
+            data=resource_requestctx.data,
+        )
+        # TODO: improve the serialization here
+        # this is done due to guest access request creation returning a dictionary,
+        # not the request item (request item does not exist before email is confirmed)
+        if isinstance(item, dict):
+            return item, 200
+        return item.to_dict(), 200
+
+    @request_view_args
+    @request_data
+    def update_access_settings(self):
+        """Update record access settings."""
+        item = self.service.access.update_access_settings(
+            id_=resource_requestctx.view_args["pid_value"],
+            identity=g.identity,
+            data=resource_requestctx.data,
+        )
+        return item.to_dict(), 200
+
 
 class RDMRecordCommunitiesResource(ErrorHandlersMixin, Resource):
     """Record communities resource."""
@@ -193,6 +466,7 @@ class RDMRecordCommunitiesResource(ErrorHandlersMixin, Resource):
             route("POST", routes["list"], self.add),
             route("DELETE", routes["list"], self.remove),
             route("GET", routes["suggestions"], self.get_suggestions),
+            route("PUT", routes["list"], self.set_default),
         ]
         return url_rules
 
@@ -265,6 +539,18 @@ class RDMRecordCommunitiesResource(ErrorHandlersMixin, Resource):
         )
         return items.to_dict(), 200
 
+    @request_view_args
+    @request_data
+    def set_default(self):
+        """Set default community."""
+        item = self.service.set_default(
+            id_=resource_requestctx.view_args["pid_value"],
+            identity=g.identity,
+            data=resource_requestctx.data,
+        )
+
+        return item, 200
+
 
 class RDMRecordRequestsResource(ErrorHandlersMixin, Resource):
     """Record requests resource."""
@@ -330,7 +616,7 @@ class RDMParentRecordLinksResource(RecordResource):
     @response_handler()
     def create(self):
         """Create a secret link for a record."""
-        item = self.service.secret_links.create(
+        item = self.service.access.create_secret_link(
             id_=resource_requestctx.view_args["pid_value"],
             identity=g.identity,
             data=resource_requestctx.data,
@@ -342,7 +628,7 @@ class RDMParentRecordLinksResource(RecordResource):
     @response_handler()
     def read(self):
         """Read a secret link for a record."""
-        item = self.service.secret_links.read(
+        item = self.service.access.read_secret_link(
             identity=g.identity,
             id_=resource_requestctx.view_args["pid_value"],
             link_id=resource_requestctx.view_args["link_id"],
@@ -358,7 +644,7 @@ class RDMParentRecordLinksResource(RecordResource):
     @response_handler()
     def partial_update(self):
         """Patch a secret link for a record."""
-        item = self.service.secret_links.update(
+        item = self.service.access.update_secret_link(
             id_=resource_requestctx.view_args["pid_value"],
             identity=g.identity,
             link_id=resource_requestctx.view_args["link_id"],
@@ -369,7 +655,7 @@ class RDMParentRecordLinksResource(RecordResource):
     @request_view_args
     def delete(self):
         """Delete a a secret link for a record."""
-        self.service.secret_links.delete(
+        self.service.access.delete_secret_link(
             id_=resource_requestctx.view_args["pid_value"],
             identity=g.identity,
             link_id=resource_requestctx.view_args["link_id"],
@@ -381,9 +667,113 @@ class RDMParentRecordLinksResource(RecordResource):
     @response_handler(many=True)
     def search(self):
         """List secret links for a record."""
-        items = self.service.secret_links.read_all(
+        items = self.service.access.read_all_secret_links(
             id_=resource_requestctx.view_args["pid_value"],
             identity=g.identity,
+        )
+        return items.to_dict(), 200
+
+
+class RDMParentGrantsResource(RecordResource):
+    """Access grants resource."""
+
+    def create_url_rules(self):
+        """Create the URL rules for the record resource."""
+
+        def p(route_name):
+            """Prefix a route with the URL prefix."""
+            return f"{self.config.url_prefix}{self.config.routes[route_name]}"
+
+        return [
+            route("GET", p("list"), self.search),
+            route("POST", p("list"), self.create),
+            route("GET", p("item"), self.read),
+            route("PUT", p("item"), self.update),
+            route("PATCH", p("item"), self.partial_update),
+            route("DELETE", p("item"), self.delete),
+        ]
+
+    @request_extra_args
+    @request_view_args
+    @response_handler()
+    def read(self):
+        """Read an access grant for a record."""
+        item = self.service.access.read_grant(
+            identity=g.identity,
+            id_=resource_requestctx.view_args["pid_value"],
+            grant_id=resource_requestctx.view_args["grant_id"],
+            expand=resource_requestctx.args.get("expand", False),
+        )
+        return item.to_dict(), 200
+
+    @request_extra_args
+    @request_view_args
+    @request_data
+    @response_handler()
+    def create(self):
+        """Create an access grant for a record."""
+        data = resource_requestctx.data
+        data["origin"] = f"api:{g.identity.id}"
+        item = self.service.access.create_grant(
+            identity=g.identity,
+            id_=resource_requestctx.view_args["pid_value"],
+            data=data,
+            expand=resource_requestctx.args.get("expand", False),
+        )
+        return item.to_dict(), 201
+
+    @request_extra_args
+    @request_view_args
+    @request_data
+    @response_handler()
+    def update(self):
+        """Update an access grant for a record."""
+        item = self.service.access.update_grant(
+            identity=g.identity,
+            id_=resource_requestctx.view_args["pid_value"],
+            grant_id=resource_requestctx.view_args["grant_id"],
+            data=resource_requestctx.data,
+            expand=resource_requestctx.args.get("expand", False),
+            partial=False,
+        )
+        return item.to_dict(), 200
+
+    @request_extra_args
+    @request_view_args
+    @request_data
+    @response_handler()
+    def partial_update(self):
+        """Patch an access grant for a record."""
+        item = self.service.access.update_grant(
+            identity=g.identity,
+            id_=resource_requestctx.view_args["pid_value"],
+            grant_id=resource_requestctx.view_args["grant_id"],
+            data=resource_requestctx.data,
+            expand=resource_requestctx.args.get("expand", False),
+            partial=True,
+        )
+        return item.to_dict(), 200
+
+    @request_view_args
+    def delete(self):
+        """Delete an access grant for a record."""
+        self.service.access.delete_grant(
+            identity=g.identity,
+            id_=resource_requestctx.view_args["pid_value"],
+            grant_id=resource_requestctx.view_args["grant_id"],
+        )
+        return "", 204
+
+    @request_extra_args
+    @request_search_args
+    @request_view_args
+    @response_handler(many=True)
+    def search(self):
+        """List access grants for a record."""
+        items = self.service.access.read_all_grants(
+            identity=g.identity,
+            id_=resource_requestctx.view_args["pid_value"],
+            expand=resource_requestctx.args.get("expand", False),
         )
         return items.to_dict(), 200
 
@@ -452,7 +842,7 @@ def with_iiif_content_negotiation(serializer):
     """Always response as JSON LD regardless of the request type."""
     return with_content_negotiation(
         response_handlers={
-            "application/ld+json": ResponseHandler(serializer()),
+            "application/ld+json": ResponseHandler(serializer(), headers=etag_headers),
         },
         default_accept_mimetype="application/ld+json",
     )
@@ -495,7 +885,7 @@ class IIIFResource(ErrorHandlersMixin, Resource):
     @response_handler()
     def manifest(self):
         """Manifest."""
-        return self._get_record_with_files(), 200
+        return self._get_record_with_files().to_dict(), 200
 
     @cross_origin(origin="*", methods=["GET"])
     @with_iiif_content_negotiation(IIIFSequenceV2JSONSerializer)
@@ -503,7 +893,7 @@ class IIIFResource(ErrorHandlersMixin, Resource):
     @response_handler()
     def sequence(self):
         """Sequence."""
-        return self._get_record_with_files(), 200
+        return self._get_record_with_files().to_dict(), 200
 
     @cross_origin(origin="*", methods=["GET"])
     @with_iiif_content_negotiation(IIIFCanvasV2JSONSerializer)
