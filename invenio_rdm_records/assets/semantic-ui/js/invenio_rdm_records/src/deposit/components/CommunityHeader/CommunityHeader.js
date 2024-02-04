@@ -5,6 +5,7 @@
 //
 // Invenio-RDM-Records is free software; you can redistribute it and/or modify it
 // under the terms of the MIT License; see LICENSE file for more details.
+/* eslint-disable */
 
 import { i18next } from "@translations/invenio_rdm_records/i18next";
 import PropTypes from "prop-types";
@@ -14,103 +15,124 @@ import { connect } from "react-redux";
 import { Button, Container } from "semantic-ui-react";
 import { changeSelectedCommunity } from "../../state/actions";
 import { CommunitySelectionModal } from "../CommunitySelectionModal";
+import {http} from "react-invenio-forms"
+  class CommunityHeaderComponent extends Component {
+    
+    constructor(props) {
+      super(props);
+      this.state = {
+        modalOpen: false,
+        role:null
+      };
+    }
+     role = async () => {
+      await http
+        .get(
+          'https://127.0.0.1:5000/api/records/role_user',
+       ''
+        )
+        .then((resp) => {
+          console.log(resp.data.role)
+          this.setState({ role: resp.data.role });
 
-class CommunityHeaderComponent extends Component {
-  constructor(props) {
-    super(props);
-    this.state = {
-      modalOpen: false,
+        });
     };
-  }
-  render() {
-    const {
-      changeSelectedCommunity,
-      community,
-      imagePlaceholderLink,
-      showCommunitySelectionButton,
-      disableCommunitySelectionButton,
-      showCommunityHeader,
-    } = this.props;
-    const { modalOpen } = this.state;
+    componentDidMount() {
+      this.role();
+    }
+    render() {
+      
+    
+      const {
+        changeSelectedCommunity,
+        community,
+        imagePlaceholderLink,
+        showCommunitySelectionButton,
+        disableCommunitySelectionButton,
+        showCommunityHeader,
+        record,
+      } = this.props;
+      const { modalOpen ,role} = this.state;
 
-    return (
-      showCommunityHeader && (
-        <Container
-          className="page-subheader-outer compact ml-0-mobile mr-0-mobile"
-          fluid
-        >
-          <Container className="page-subheader">
-            {community ? (
-              <>
+      return (
+        showCommunityHeader && (
+          <Container
+            className="page-subheader-outer compact ml-0-mobile mr-0-mobile"
+            fluid
+          >
+            <Container className="page-subheader">
+              {community ? (
+                <>
+                  <div className="page-subheader-element">
+                    <Image
+                      rounded
+                      className="community-header-logo"
+                      src={community.links?.logo || imagePlaceholderLink} // logo is undefined when new draft and no selection
+                      fallbackSrc={imagePlaceholderLink}
+                    />
+                  </div>
+                  <div className="page-subheader-element flex align-items-center">
+                    {community.metadata.title}
+                  </div>
+                </>
+              ) : (
                 <div className="page-subheader-element">
-                  <Image
-                    size="tiny"
-                    className="community-header-logo"
-                    src={community.links?.logo || imagePlaceholderLink} // logo is undefined when new draft and no selection
-                    fallbackSrc={imagePlaceholderLink}
-                  />
+                  {i18next.t(
+                    "Select the community where you want to submit your record."
+                  )}
                 </div>
-                <div className="page-subheader-element flex align-items-center">
-                  {community.metadata.title}
-                </div>
-              </>
-            ) : (
-              <div className="page-subheader-element">
-                {i18next.t(
-                  "Select the community where you want to submit your record."
+              )}
+              <div className="community-header-element flex align-items-center rel-ml-1">
+                {showCommunitySelectionButton && role === 'stuff'&& (
+                  <>
+                    <CommunitySelectionModal
+                      onCommunityChange={(community) => {
+                        changeSelectedCommunity(community);
+                        this.setState({ modalOpen: false });
+                      }}
+                      onModalChange={(value) => this.setState({ modalOpen: value })}
+                      modalOpen={modalOpen}
+                      chosenCommunity={community}
+                      displaySelected
+                      record={record}
+                      trigger={
+                        <Button
+                          className="community-header-button"
+                          disabled={disableCommunitySelectionButton}
+                          onClick={() => this.setState({ modalOpen: true })}
+                          primary
+                          size="mini"
+                          name="setting"
+                          type="button"
+                          content={
+                            community
+                              ? i18next.t("Change")
+                              : i18next.t("Select a community")
+                          }
+                        />
+                      }
+                    />
+                    {community && role === 'stuff' && (
+                      <Button
+                        basic
+                        size="mini"
+                        labelPosition="left"
+                        className="community-header-button ml-5"
+                        onClick={() => changeSelectedCommunity(null)}
+                        content={i18next.t("Remove")}
+                        icon="close"
+                        disabled={disableCommunitySelectionButton}
+                      />
+                    )}
+                  </>
                 )}
               </div>
-            )}
-            <div className="community-header-element rel-ml-1">
-              {showCommunitySelectionButton && (
-                <>
-                  <CommunitySelectionModal
-                    onCommunityChange={(community) => {
-                      changeSelectedCommunity(community);
-                      this.setState({ modalOpen: false });
-                    }}
-                    onModalChange={(value) => this.setState({ modalOpen: value })}
-                    modalOpen={modalOpen}
-                    chosenCommunity={community}
-                    displaySelected
-                    trigger={
-                      <Button
-                        className="community-header-button"
-                        disabled={disableCommunitySelectionButton}
-                        onClick={() => this.setState({ modalOpen: true })}
-                        primary
-                        size="mini"
-                        name="setting"
-                        type="button"
-                        content={
-                          community
-                            ? i18next.t("Change")
-                            : i18next.t("Select a community")
-                        }
-                      />
-                    }
-                  />
-                  {community && (
-                    <Button
-                      basic
-                      color="black"
-                      size="mini"
-                      className="community-header-button ml-5"
-                      onClick={() => changeSelectedCommunity(null)}
-                      content={i18next.t("Remove")}
-                      icon="close"
-                      disabled={disableCommunitySelectionButton}
-                    />
-                  )}
-                </>
-              )}
-            </div>
+            </Container>
           </Container>
-        </Container>
-      )
-    );
+        )
+      );
+    }
   }
-}
 
 CommunityHeaderComponent.propTypes = {
   imagePlaceholderLink: PropTypes.string.isRequired,
@@ -119,6 +141,7 @@ CommunityHeaderComponent.propTypes = {
   showCommunitySelectionButton: PropTypes.bool.isRequired,
   showCommunityHeader: PropTypes.bool.isRequired,
   changeSelectedCommunity: PropTypes.func.isRequired,
+  record: PropTypes.object.isRequired,
 };
 
 CommunityHeaderComponent.defaultProps = {

@@ -11,6 +11,7 @@
 
 """Bibliographic Record Resource."""
 from functools import wraps
+import json
 import uuid
 
 from invenio_userprofiles import current_userprofile
@@ -61,8 +62,10 @@ from .serializers import (
 from invenio_communities.communities.records.models import CommunityMetadata
 from invenio_communities.members.records.models import MemberModel
 from sqlalchemy.orm import joinedload
-
-
+from invenio_requests.records.models import RequestMetadata
+from sqlalchemy import func
+from sqlalchemy import  text
+from sqlalchemy.orm import make_transient, scoped_session
 class RDMRecordResource(RecordResource):
     """RDM record resource."""
 
@@ -102,6 +105,11 @@ class RDMRecordResource(RecordResource):
             route("GET", p(routes["saved"]), self.get_saved),
             route("POST", p(routes["communites"]), self.createCommunites),
             route("GET", p(routes["role"]), self.userRole),
+            route("GET", p(routes["role_user"]), self.role),
+            route("POST", p(routes["language"]), self.language),
+            route("POST",p(routes["request_num"]),self.requestCount),
+            route("POST",p(routes["request_list"]),self.requestAccept)
+            
         ]
 
         return url_rules
@@ -127,7 +135,14 @@ class RDMRecordResource(RecordResource):
             .options(joinedload(User.roles))
             .first()
         )
-
+       
+        # users_with_role = User.query.join(User.roles).filter(Role.name == reviewer).all()
+        count_users_with_role = (
+            db.session.query(func.count(User.id))
+            .join(User.roles)
+            .filter(Role.name == 'reviewer')
+            .scalar()
+        )
         if user:
             roles = user.roles
             for role in roles:
@@ -138,16 +153,34 @@ class RDMRecordResource(RecordResource):
         if role == "student":
             identifer = f"{institution}_{user_id}_student"
             data = {"institution": institution, "identifer": identifer}
+        elif role=='stuff':
+             data={"institution": "null", "identifer": "null"}
+        elif count_users_with_role <= 2:
+             data={"institution": "none", "identifer": "none"}
+             
         else:
             identifer = f"{institution}_{user_id}"
             data = {"institution": institution, "identifer": identifer}
 
         return data, 200
-
+    def role(self):
+        user_id = self.userInfo()
+        user = (
+            User.query.filter(User.id == user_id)
+            .options(joinedload(User.roles))
+            .first()
+        )
+        role=''
+        if user:
+            roles = user.roles
+            for role in roles:
+                role = role.name
+        role_data={"role":role}
+        return role_data
     def userRole(self):
         user_id = self.userInfo()
         list_slug = []
-
+      
         communities = CommunityMetadata.query.filter(
             CommunityMetadata.deletion_status == "P"
         ).all()
@@ -165,7 +198,7 @@ class RDMRecordResource(RecordResource):
         user_community_roles = MemberModel.query.filter(
             MemberModel.user_id == user_id, MemberModel.community_id.in_(community_ids)
         ).all()
-
+        
         community_statuses = []
         for role in user_community_roles:
             community = CommunityMetadata.query.filter(
@@ -176,13 +209,59 @@ class RDMRecordResource(RecordResource):
                 community_status = {
                     "id": str(community.id),
                     "community_status": community.community_status,
+                    "role":role
+                    
                 }
             community_statuses.append(community_status)
         db.session.execute(update_statement)
         db.session.commit()
 
         return community_statuses
+    def language(self):
+        request_data = request.get_json()
+        lang=request_data["value"]
+        return "LANG"
+    def requestCount(self):
+        request_data = request.get_json()
+        account_id = current_user.get_id()
+        converted_int = int(account_id)
+        request_metadata = RequestMetadata.query.filter_by(id=request_data['id']).first()
+        request_metadata.ownerrequest_status
+        result={"id":request_data['id'],"owner_id":converted_int,"status":request_metadata.ownerrequest_status}
+        return result ,200
 
+
+    def requestAccept(self):
+        try:
+            user_instance = User.query.get(current_user.id)
+            with db.session.begin(subtransactions=True):  # Begin a transaction
+                db.session.refresh(user_instance)
+                account_id = user_instance.get_id()
+                converted_int = int(account_id)
+                request_data = request.get_json()
+                request_id = request_data['id']
+                table_name = 'request_metadata'
+                target_id = request_data['id']
+                new_json_data = {"status": "A", "owner_Id": converted_int}
+
+                update_query = f"""
+                    UPDATE {table_name}
+                    SET ownerrequest_status = ownerrequest_status || :new_json_data
+                    WHERE id = :target_id
+                """
+
+                db.session.execute(
+                    text(update_query),
+                    {'new_json_data': json.dumps(new_json_data), 'target_id': target_id}
+                )
+
+        except Exception as e:
+            db.session.rollback()
+            return {"error": str(e)}, 500
+        finally:
+            db.session.commit()
+        request_metadata = RequestMetadata.query.filter_by(id=request_id).first()
+        return request_metadata.ownerrequest_status, 200
     def send_email(self):
         request_data = request.get_json()
         name = request_data.get("name")
